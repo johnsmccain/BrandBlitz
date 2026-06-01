@@ -158,6 +158,7 @@ export function parseLeaderboardEntries(data: unknown): LeaderboardEntry[] {
 }
 
 export interface UserProfile {
+  userId?: string;
   displayName: string;
   username: string;
   league: "bronze" | "silver" | "gold" | null;

@@ -7,7 +7,61 @@ import * as apiModule from "@/lib/api";
 
 // Mock next/navigation
 vi.mock("next/navigation", () => ({
-  useRouter: vi.fn(),
+  useRouter: () => ({
+    push: pushMock,
+  }),
+}));
+
+vi.mock("@/lib/api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
+
+  return {
+    ...actual,
+    createApiClient: () => ({
+      post: postMock,
+    }),
+  };
+});
+
+vi.mock("./upload-field", () => ({
+  UploadField: ({
+    label,
+    uploadType,
+    onUploaded,
+  }: {
+    label: string;
+    uploadType: "brand-logo" | "product-image";
+    onUploaded: (key: string, publicUrl: string) => void;
+  }) => (
+    <button
+      type="button"
+      onClick={() => {
+        if (uploadType === "brand-logo") {
+          onUploaded("logo-key-123", "https://cdn.example/logo.webp");
+          return;
+        }
+
+        const count = (globalThis as any).__productUploadCount ?? 0;
+        const nextCount = count + 1;
+        (globalThis as any).__productUploadCount = nextCount;
+        onUploaded(`product-key-${nextCount}`, `https://cdn.example/product-${nextCount}.webp`);
+      }}
+    >
+      Upload {label}
+    </button>
+  ),
+}));
+
+const mocks = vi.hoisted(() => ({
+  push: vi.fn(),
+  post: vi.fn(),
+  productUploadCount: 0,
+}));
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({
+    push: mocks.push,
+  }),
 }));
 
 // Mock the API client

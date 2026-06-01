@@ -1,9 +1,8 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import Script from "next/script";
-import { SessionProvider } from "next-auth/react";
-import { Toaster } from "sonner";
 import { AuthBoundary } from "@/components/auth/auth-boundary";
+import { Providers } from "@/components/providers";
 import { getCspNonce } from "@/lib/csp";
 import { FingerprintProvider } from "@/components/providers/fingerprint-provider";
 import "./globals.css";
