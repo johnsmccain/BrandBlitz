@@ -1,4 +1,5 @@
-import { query } from "../index";
+import type { PoolClient } from "pg";
+import { pool, query } from "../index";
 
 export interface GameSession {
   id: string;
@@ -9,13 +10,18 @@ export interface GameSession {
   warmup_completed_at: string | null;
   challenge_started_at: string | null;
   completed_at: string | null;
+  round_1_answer: string | null;
   round_1_score: number;
+  round_2_answer: string | null;
   round_2_score: number;
+  round_3_answer: string | null;
   round_3_score: number;
   total_score: number;
+  rank: number | null;
   flagged: boolean;
   flag_reasons: string[] | null;
   is_practice: boolean;
+  integrity_hmac: string | null;
   created_at: string;
 }
 
@@ -52,6 +58,22 @@ export async function createSession(data: {
     [data.userId, data.challengeId, data.deviceId ?? null, data.isPractice ?? false]
   );
   return result.rows[0];
+}
+
+export async function claimSession(data: {
+  userId: string;
+  challengeId: string;
+  deviceId?: string;
+  isPractice?: boolean;
+}): Promise<GameSession | null> {
+  const result = await query<GameSession>(
+    `INSERT INTO game_sessions (user_id, challenge_id, device_id, is_practice)
+     VALUES ($1,$2,$3,$4)
+     ON CONFLICT (user_id, challenge_id) DO NOTHING
+     RETURNING *`,
+    [data.userId, data.challengeId, data.deviceId ?? null, data.isPractice ?? false]
+  );
+  return result.rows[0] ?? null;
 }
 
 export async function getSession(userId: string, challengeId: string): Promise<GameSession | null> {
@@ -94,48 +116,114 @@ export async function markChallengeStarted(sessionId: string): Promise<void> {
   );
 }
 
+async function withTransaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const result = await callback(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export async function recordRoundScore(
   sessionId: string,
   round: 1 | 2 | 3,
-  score: number
+  score: number,
+  answer: string | null = null,
+  reactionTimeMs: number | null = null
 ): Promise<void> {
   if (![1, 2, 3].includes(round)) {
     throw new Error("Invalid round");
   }
 
   const roundColumn = `round_${round}_score`;
+  const answerColumn = `round_${round}_answer`;
+  const reactionColumn = `round_${round}_reaction_ms`;
 
   await query(
     `WITH upserted AS (
-       INSERT INTO session_round_scores (session_id, round, score)
-       VALUES ($1, $2, $3)
+       INSERT INTO session_round_scores (session_id, round, score, answer, reaction_time_ms)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (session_id, round) DO UPDATE
          SET score = EXCLUDED.score,
-             updated_at = NOW()
-       RETURNING session_id, score
+             answer = EXCLUDED.answer,
+             reaction_time_ms = EXCLUDED.reaction_time_ms
+       RETURNING session_id, score, answer, reaction_time_ms
      )
      UPDATE game_sessions
-     SET ${roundColumn} = (SELECT score FROM upserted)
+     SET ${roundColumn} = (SELECT score FROM upserted),
+         ${answerColumn} = (SELECT answer FROM upserted),
+         ${reactionColumn} = (SELECT reaction_time_ms FROM upserted)
      WHERE id = $1`,
-    [sessionId, round, score]
+    [sessionId, round, score, answer, reactionTimeMs]
   );
 }
 
 export async function finishSession(sessionId: string): Promise<GameSession> {
-  const result = await query<GameSession>(
-    `UPDATE game_sessions
-     SET completed_at = NOW(),
-         status = 'completed',
-         total_score = COALESCE((
-           SELECT SUM(score)::int
-           FROM session_round_scores
-           WHERE session_id = $1
-         ), 0)
-     WHERE id = $1
-     RETURNING *`,
-    [sessionId]
+  return withTransaction<GameSession>(async (client) => {
+    const sessionResult = await client.query<GameSession>(
+      `SELECT *
+       FROM game_sessions
+       WHERE id = $1
+       FOR UPDATE`,
+      [sessionId]
+    );
+    const current = sessionResult.rows[0];
+    if (!current) {
+      throw new Error("Session not found");
+    }
+
+    if (current.completed_at) {
+      return current;
+    }
+
+    const totalResult = await client.query<{ total_score: number }>(
+      `SELECT COALESCE(SUM(score)::int, 0) AS total_score
+       FROM session_round_scores
+       WHERE session_id = $1`,
+      [sessionId]
+    );
+    const totalScore = totalResult.rows[0]?.total_score ?? 0;
+
+    const finishedResult = await client.query<GameSession>(
+      `UPDATE game_sessions
+       SET completed_at = NOW(),
+           status = 'completed',
+           total_score = $2
+       WHERE id = $1
+       RETURNING *`,
+      [sessionId, totalScore]
+    );
+    const finished = finishedResult.rows[0];
+    if (!finished) {
+      throw new Error("Session not found");
+    }
+
+    await client.query(
+      `UPDATE users
+       SET total_score = total_score + $2,
+           challenges_played = challenges_played + 1,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [finished.user_id, finished.total_score]
+    );
+
+    return finished;
+  });
+}
+
+export async function storeSessionHmac(sessionId: string, hmac: string): Promise<void> {
+  await query(
+    "UPDATE game_sessions SET integrity_hmac = $1 WHERE id = $2",
+    [hmac, sessionId]
   );
-  return result.rows[0];
 }
 
 export async function flagSession(
@@ -150,6 +238,23 @@ export async function flagSession(
      WHERE id = $2`,
     [reasons, sessionId]
   );
+}
+
+export async function markAbandonedSessions(): Promise<number> {
+  const result = await query<{ count: number }>(
+    `WITH abandoned AS (
+       UPDATE game_sessions
+       SET status = 'abandoned',
+           completed_at = COALESCE(completed_at, NOW()),
+           updated_at = NOW()
+       WHERE status IN ('warmup', 'active')
+         AND COALESCE(challenge_started_at, warmup_started_at, created_at) < NOW() - INTERVAL '2 hours'
+       RETURNING id
+     )
+     SELECT COUNT(*)::int AS count FROM abandoned`
+  );
+
+  return result.rows[0]?.count ?? 0;
 }
 
 export async function getLeaderboard(
@@ -173,6 +278,8 @@ export async function getLeaderboard(
      WHERE gs.challenge_id = $1
        AND gs.flagged = FALSE
        AND gs.is_practice = FALSE
+       AND gs.status = 'completed'
+       AND u.deleted_at IS NULL
      ORDER BY gs.total_score DESC, gs.completed_at ASC
      LIMIT $2 OFFSET $3`,
     [challengeId, limit, offset]
@@ -184,19 +291,14 @@ export async function getTopSessionsPerChallenge(
   challengeIds: string[],
   limitPerChallenge = 10
 ): Promise<LeaderboardSession[]> {
-  if (challengeIds.length === 0) return [];
+  if (challengeIds.length === 0) {
+    return [];
+  }
 
-  const result = await query<LeaderboardSession>(
-    `SELECT sub.id, sub.user_id, sub.challenge_id, sub.device_id,
-            sub.warmup_started_at, sub.warmup_completed_at,
-            sub.challenge_started_at, sub.completed_at,
-            sub.round_1_score, sub.round_2_score, sub.round_3_score,
-            sub.total_score, sub.flagged, sub.flag_reasons,
-            sub.is_practice, sub.created_at,
-            sub.username, sub.avatar_url, sub.display_name, sub.league, sub.total_earned_usdc, sub.stellar_address
-     FROM (
+  const result = await query<LeaderboardSession & { challenge_rank: number }>(
+    `WITH ranked AS (
        SELECT gs.*,
-              u.email        AS username,
+              u.email AS username,
               u.avatar_url,
               u.display_name,
               u.league,
@@ -208,16 +310,42 @@ export async function getTopSessionsPerChallenge(
               ROW_NUMBER() OVER (
                 PARTITION BY gs.challenge_id
                 ORDER BY gs.total_score DESC, gs.completed_at ASC
-              ) AS rn
+              ) AS challenge_rank
        FROM game_sessions gs
        JOIN users u ON gs.user_id = u.id
        WHERE gs.challenge_id = ANY($1::uuid[])
          AND gs.flagged = FALSE
          AND gs.is_practice = FALSE
-     ) sub
-     WHERE sub.rn <= $2
-     ORDER BY sub.challenge_id, sub.total_score DESC, sub.completed_at ASC`,
+         AND gs.status = 'completed'
+         AND u.deleted_at IS NULL
+     )
+     SELECT *
+     FROM ranked
+     WHERE challenge_rank <= $2
+     ORDER BY challenge_id ASC, challenge_rank ASC`,
     [challengeIds, limitPerChallenge]
+  );
+
+  return result.rows;
+}
+
+export async function getArchivedLeaderboard(
+  challengeId: string,
+  limit = 20,
+  offset = 0
+): Promise<Array<GameSession & { username: string; avatar_url: string }>> {
+  const result = await query<GameSession & { username: string; avatar_url: string }>(
+    `SELECT gs.*, u.email as username, u.avatar_url
+     FROM game_sessions_archive gs
+     JOIN users u ON gs.user_id = u.id
+     WHERE gs.challenge_id = $1
+       AND gs.flagged = FALSE
+       AND gs.is_practice = FALSE
+       AND gs.status = 'completed'
+       AND u.deleted_at IS NULL
+     ORDER BY gs.total_score DESC, gs.challenge_ended_at ASC
+     LIMIT $2 OFFSET $3`,
+    [challengeId, limit, offset]
   );
   return result.rows;
 }

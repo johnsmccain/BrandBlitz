@@ -47,8 +47,10 @@ async function startServer(): Promise<{ server: Server; baseUrl: string }> {
   app.use("/webhooks", webhooksRouter);
   app.use(errorHandler);
 
-  const server = app.listen(0);
-  await new Promise<void>((resolve) => server.once("listening", resolve));
+const app = express();
+app.use(express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } }));
+app.use("/webhooks", webhooksRouter);
+app.use(errorHandler);
 
   const address = server.address();
   if (!address || typeof address === "string") {
@@ -62,6 +64,20 @@ async function startServer(): Promise<{ server: Server; baseUrl: string }> {
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
+
+function createWebhookHeaders(body: object, override?: Partial<Record<string, string>>) {
+  const payload = JSON.stringify(body);
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const signature = signWebhookPayload(payload, Number(timestamp));
+  const defaultId = `test-webhook-id-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return {
+    "x-webhook-secret": WEBHOOK_SECRET,
+    "x-webhook-timestamp": timestamp,
+    "x-webhook-signature": `sha256=${signature}`,
+    "x-webhook-id": override?.["x-webhook-id"] ?? defaultId,
+    ...override,
+  };
+}
 
 describe("Webhooks API", () => {
   let currentServer: Server | undefined;

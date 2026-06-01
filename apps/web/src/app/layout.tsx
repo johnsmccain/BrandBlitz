@@ -1,7 +1,10 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import Script from "next/script";
-import { SessionProvider } from "next-auth/react";
+import { AuthBoundary } from "@/components/auth/auth-boundary";
+import { Providers } from "@/components/providers";
+import { getCspNonce } from "@/lib/csp";
+import { FingerprintProvider } from "@/components/providers/fingerprint-provider";
 import "./globals.css";
 
 const inter = Inter({
@@ -21,10 +24,12 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const nonce = getCspNonce();
+
   return (
     <html lang="en" className={inter.className}>
       <head>
-        <Script id="theme-init" strategy="beforeInteractive">
+        <Script id="theme-init" strategy="beforeInteractive" nonce={nonce}>
           {`
             (function () {
               try {
@@ -41,8 +46,15 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           `}
         </Script>
       </head>
-      <body className="min-h-screen flex flex-col antialiased bg-[var(--background)] text-[var(--foreground)]">
-        <SessionProvider>{children}</SessionProvider>
+      <body className="flex min-h-screen flex-col bg-[var(--background)] text-[var(--foreground)] antialiased">
+        <FingerprintProvider>
+          <AuthBoundary>
+            <SessionProvider>
+              {children}
+              <Toaster closeButton position="top-right" richColors />
+            </SessionProvider>
+          </AuthBoundary>
+        </FingerprintProvider>
       </body>
     </html>
   );

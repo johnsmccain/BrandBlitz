@@ -1,16 +1,20 @@
 import { query } from "../index";
+import { usdcToStroops } from "../../lib/usdc";
 
 export type ChallengeStatus =
   | "pending_deposit"
   | "active"
   | "ended"
   | "settled"
-  | "payout_failed";
+  | "payout_failed"
+  | "cancelled"
+  | "refunded";
 
 export interface Challenge {
   id: string;
   brand_id: string;
   challenge_id: string;
+  pool_amount_stroops: string;
   pool_amount_usdc: string;
   participant_count?: number;
   brand_name?: string;
@@ -23,6 +27,7 @@ export interface Challenge {
   max_players: number | null;
   starts_at: string;
   ends_at: string | null;
+  deleted_at: string | null;
   created_at: string;
 }
 
@@ -30,8 +35,8 @@ export interface ChallengeQuestion {
   id: string;
   challenge_id: string;
   round: 1 | 2 | 3;
-  question_type: string;
-  prompt_type: string;
+  question_type: "which_brand" | "which_tagline" | "which_product";
+  prompt_type: "logo" | "productImage1" | "tagline";
   question_text: string;
   correct_answer: string;
   option_a: string;
@@ -50,17 +55,23 @@ export async function createChallenge(data: {
 }): Promise<Challenge> {
   const result = await query<Challenge>(
     `INSERT INTO challenges
-       (brand_id, challenge_id, pool_amount_usdc, max_players, ends_at)
+       (brand_id, challenge_id, pool_amount_stroops, max_players, ends_at)
      VALUES ($1,$2,$3,$4,$5)
-     RETURNING *`,
-    [data.brandId, data.challengeId, data.poolAmountUsdc, data.maxPlayers ?? null, data.endsAt ?? null]
+     RETURNING *, (pool_amount_stroops::numeric / 10000000)::numeric(20,7)::text AS pool_amount_usdc`,
+    [
+      data.brandId,
+      data.challengeId,
+      usdcToStroops(data.poolAmountUsdc),
+      data.maxPlayers ?? null,
+      data.endsAt ?? null,
+    ]
   );
   return result.rows[0];
 }
 
 export async function getChallengeByMemo(challengeId: string): Promise<Challenge | null> {
   const result = await query<Challenge>(
-    "SELECT * FROM challenges WHERE deposit_memo = $1",
+    "SELECT *, (pool_amount_stroops::numeric / 10000000)::numeric(20,7)::text AS pool_amount_usdc FROM challenges WHERE deposit_memo = $1 AND deleted_at IS NULL",
     [challengeId]
   );
   return result.rows[0] ?? null;
@@ -68,24 +79,44 @@ export async function getChallengeByMemo(challengeId: string): Promise<Challenge
 
 export async function getChallengeByDepositTxHash(txHash: string): Promise<Challenge | null> {
   const result = await query<Challenge>(
-    "SELECT * FROM challenges WHERE deposit_tx_hash = $1 LIMIT 1",
+    "SELECT *, (pool_amount_stroops::numeric / 10000000)::numeric(20,7)::text AS pool_amount_usdc FROM challenges WHERE deposit_tx_hash = $1 AND deleted_at IS NULL LIMIT 1",
     [txHash]
   );
   return result.rows[0] ?? null;
 }
 
 export async function getChallengeById(id: string): Promise<Challenge | null> {
-  const result = await query<Challenge>("SELECT * FROM challenges WHERE id = $1", [id]);
+  const result = await query<Challenge>(
+    "SELECT *, (pool_amount_stroops::numeric / 10000000)::numeric(20,7)::text AS pool_amount_usdc FROM challenges WHERE id = $1 AND deleted_at IS NULL",
+    [id]
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function getArchivedChallengeById(id: string): Promise<Challenge | null> {
+  const result = await query<Challenge>("SELECT * FROM challenges_archive WHERE id = $1", [id]);
+  return result.rows[0] ?? null;
+}
+
+export async function getChallengeByIdAny(id: string): Promise<Challenge & { archived: boolean } | null> {
+  const result = await query<Challenge & { archived: boolean }>(
+    `SELECT *, false AS archived FROM challenges WHERE id = $1 AND deleted_at IS NULL
+     UNION ALL
+     SELECT *, true AS archived FROM challenges_archive WHERE id = $1
+     LIMIT 1`,
+    [id]
+  );
   return result.rows[0] ?? null;
 }
 
 export async function getActiveChallenges(limit = 20, offset = 0): Promise<Challenge[]> {
   const result = await query<Challenge>(
-    `SELECT c.*, b.name as brand_name, b.logo_url, b.primary_color, b.secondary_color
+    `SELECT c.*, (c.pool_amount_stroops::numeric / 10000000)::numeric(20,7)::text AS pool_amount_usdc,
+            b.name as brand_name, b.logo_url, b.primary_color, b.secondary_color
      FROM challenges c
      JOIN brands b ON c.brand_id = b.id
-     WHERE c.status = 'active'
-     ORDER BY c.pool_amount_usdc DESC
+     WHERE c.status = 'active' AND c.deleted_at IS NULL AND b.deleted_at IS NULL
+     ORDER BY c.pool_amount_stroops DESC
      LIMIT $1 OFFSET $2`,
     [limit, offset]
   );
@@ -98,15 +129,31 @@ export async function getChallengesByBrandId(
   offset = 0
 ): Promise<Challenge[]> {
   const result = await query<Challenge>(
-    `SELECT c.*, b.name as brand_name, b.logo_url, b.primary_color, b.secondary_color
+    `SELECT c.*, (c.pool_amount_stroops::numeric / 10000000)::numeric(20,7)::text AS pool_amount_usdc,
+            b.name as brand_name, b.logo_url, b.primary_color, b.secondary_color
      FROM challenges c
      JOIN brands b ON c.brand_id = b.id
-     WHERE c.brand_id = $1
+     WHERE c.brand_id = $1 AND c.deleted_at IS NULL
      ORDER BY c.created_at DESC
      LIMIT $2 OFFSET $3`,
     [brandId, limit, offset]
   );
   return result.rows;
+}
+/**
+ * Soft-delete a challenge.
+ */
+export async function softDeleteChallenge(id: string): Promise<void> {
+  await query("UPDATE challenges SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL", [
+    id,
+  ]);
+}
+
+/**
+ * Restore a soft-deleted challenge.
+ */
+export async function restoreChallenge(id: string): Promise<void> {
+  await query("UPDATE challenges SET deleted_at = NULL, updated_at = NOW() WHERE id = $1", [id]);
 }
 
 export async function updateChallengeStatus(

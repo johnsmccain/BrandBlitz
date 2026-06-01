@@ -86,17 +86,19 @@ describeIntegration("challenges db queries", () => {
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         brand_id UUID NOT NULL REFERENCES brands(id) ON DELETE CASCADE,
         challenge_id TEXT NOT NULL UNIQUE,
-        pool_amount_usdc NUMERIC(20,7) NOT NULL,
+        pool_amount_stroops BIGINT NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'pending_deposit',
         stellar_deposit_tx TEXT,
         deposit_memo TEXT UNIQUE,
         payout_tx_hashes TEXT[],
         max_players INTEGER,
         starts_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        ends_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
+        ends_at             TIMESTAMPTZ,
+        deleted_at          TIMESTAMPTZ,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        `);
+
     await query(
       `CREATE INDEX idx_challenges_deposit_memo ON challenges (deposit_memo)`
     );
@@ -107,8 +109,8 @@ describeIntegration("challenges db queries", () => {
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         challenge_id UUID NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
         round INTEGER NOT NULL CHECK (round IN (1, 2, 3)),
-        question_type TEXT NOT NULL,
-        prompt_type TEXT NOT NULL,
+        question_type TEXT NOT NULL CHECK (question_type IN ('which_brand', 'which_tagline', 'which_product')),
+        prompt_type TEXT NOT NULL CHECK (prompt_type IN ('logo', 'productImage1', 'tagline')),
         question_text TEXT NOT NULL,
         correct_answer TEXT NOT NULL,
         option_a TEXT NOT NULL,
@@ -150,6 +152,7 @@ describeIntegration("challenges db queries", () => {
     expect(challenge.brand_id).toBe(brandId);
     expect(challenge.status).toBe("pending_deposit");
     expect(Number(challenge.pool_amount_usdc)).toBe(100);
+    expect(challenge.pool_amount_stroops).toBe("1000000000");
     expect(challenge.max_players).toBe(50);
     expect(challenge.stellar_deposit_tx).toBeNull();
     expect(challenge.payout_tx_hashes).toBeNull();
@@ -261,7 +264,7 @@ describeIntegration("challenges db queries", () => {
     expect(pendingInResults).toBe(false);
   });
 
-  it("getActiveChallenges orders by pool_amount_usdc DESC", async () => {
+  it("getActiveChallenges orders by pool_amount_stroops DESC", async () => {
     const userId = await createUser("active-order");
     const brandId = await createBrand(userId, "Order Brand");
 
@@ -372,8 +375,8 @@ describeIntegration("challenges db queries", () => {
     const questions = [1, 2, 3].map((round) => ({
       challenge_id: created.id,
       round: round as 1 | 2 | 3,
-      question_type: "brand_trivia",
-      prompt_type: "text",
+      question_type: "which_brand",
+      prompt_type: "tagline",
       question_text: `Question ${round}?`,
       correct_answer: `Answer ${round}`,
       option_a: "A answer",
@@ -404,8 +407,8 @@ describeIntegration("challenges db queries", () => {
 
     const baseQuestion = {
       challenge_id: created.id,
-      question_type: "brand_trivia",
-      prompt_type: "text",
+      question_type: "which_brand",
+      prompt_type: "tagline",
       question_text: "Duplicate?",
       correct_answer: "Yes",
       option_a: "A",
@@ -443,8 +446,8 @@ describeIntegration("challenges db queries", () => {
     const questions = [3, 1, 2].map((round) => ({
       challenge_id: created.id,
       round: round as 1 | 2 | 3,
-      question_type: "brand_trivia",
-      prompt_type: "text",
+      question_type: "which_brand",
+      prompt_type: "tagline",
       question_text: `Question round ${round}`,
       correct_answer: `Answer ${round}`,
       option_a: "A",
@@ -483,8 +486,8 @@ describeIntegration("challenges db queries", () => {
       {
         challenge_id: created.id,
         round: 1,
-        question_type: "brand_trivia",
-        prompt_type: "text",
+        question_type: "which_tagline",
+        prompt_type: "logo",
         question_text: "Private test?",
         correct_answer: "Yes",
         option_a: "A",
@@ -501,6 +504,42 @@ describeIntegration("challenges db queries", () => {
     expect(result[0].correct_option).toBe("B");
   });
 
+  it("round-trips question and prompt types", async () => {
+    const userId = await createUser("get-q-types");
+    const brandId = await createBrand(userId);
+
+    const created = await challenges.createChallenge({
+      brandId,
+      challengeId: `q-types-${randomUUID()}`,
+      poolAmountUsdc: "100.0000000",
+    });
+
+    await challenges.insertChallengeQuestions([
+      {
+        challenge_id: created.id,
+        round: 1,
+        question_type: "which_product",
+        prompt_type: "productImage1",
+        question_text: "Which brand makes this product?",
+        correct_answer: "Acme",
+        option_a: "Acme",
+        option_b: "Beta",
+        option_c: "Cyan",
+        option_d: "Delta",
+        correct_option: "A",
+      },
+    ]);
+
+    const result = await challenges.getChallengeQuestions(created.id);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      question_type: "which_product",
+      prompt_type: "productImage1",
+      question_text: "Which brand makes this product?",
+    });
+  });
+
   // ── deposit_memo index performance ─────────────────────────────────────────
   it("getChallengeByMemo lookup completes in < 5ms with 10k rows", async () => {
     const userId = await createUser("memo-perf");
@@ -515,13 +554,13 @@ describeIntegration("challenges db queries", () => {
         return `('${brandId}', 'perf-cid-${randomUUID()}', 100, 'perf-memo-${idx}-${randomUUID()}')`;
       }).join(",");
       await query(
-        `INSERT INTO challenges (brand_id, challenge_id, pool_amount_usdc, deposit_memo) VALUES ${values}`
+        `INSERT INTO challenges (brand_id, challenge_id, pool_amount_stroops, deposit_memo) VALUES ${values}`
       );
     }
 
     const targetMemo = `target-memo-${randomUUID()}`;
     await query(
-      `INSERT INTO challenges (brand_id, challenge_id, pool_amount_usdc, deposit_memo)
+      `INSERT INTO challenges (brand_id, challenge_id, pool_amount_stroops, deposit_memo)
        VALUES ($1, $2, 50, $3)`,
       [brandId, `target-cid-${randomUUID()}`, targetMemo]
     );

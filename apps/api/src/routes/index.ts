@@ -8,8 +8,22 @@ import usersRoutes from "./users";
 import leaderboardRoutes from "./leaderboard";
 import webhooksRoutes from "./webhooks";
 import leaguesRoutes from "./leagues";
+import adminConfigRoutes from "./admin/config";
+import adminUsersRoutes from "./admin/users";
+import adminFraudRoutes from "./admin/fraud";
+import adminChallengesRoutes from "./admin/challenges";
+import deleteAccountRoutes from "./me/delete-account";
+import docsRoutes from "./docs";
+import cspReportRoutes from "./csp-report";
+import legalRoutes from "./legal";
 
 export function registerRoutes(app: Express): void {
+  // #143 — interactive OpenAPI 3.1 docs at /docs (Scalar UI) plus
+  // the JSON spec at /docs/openapi.json. Mounted first so it can't
+  // be accidentally shadowed by a route added below.
+  app.use("/docs", docsRoutes);
+  app.use("/csp-report", cspReportRoutes);
+  app.use("/legal", legalRoutes);
   app.use("/auth", authRoutes);
   app.use("/brands", brandsRoutes);
   app.use("/challenges", challengesRoutes);
@@ -19,4 +33,9 @@ export function registerRoutes(app: Express): void {
   app.use("/leaderboard", leaderboardRoutes);
   app.use("/webhooks", webhooksRoutes);
   app.use("/leagues", leaguesRoutes);
+  app.use("/admin/config", adminConfigRoutes);
+  app.use("/admin/users", adminUsersRoutes);
+  app.use("/admin/fraud-flags", adminFraudRoutes);
+  app.use("/admin/challenges", adminChallengesRoutes);
+  app.use("/me/delete-account", deleteAccountRoutes);
 }

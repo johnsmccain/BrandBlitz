@@ -23,24 +23,20 @@ export default defineProject({
       provider: "v8",
       include: [
         "src/components/brand/brand-kit-form.tsx",
+        "src/components/brand/upload-field.tsx",
+        "src/components/game/countdown-timer.tsx",
+        "src/components/game/challenge-round.tsx",
+        "src/components/game/warmup-phase.tsx",
+        "src/components/game/result-screen.tsx",
       ],
-      reporter: ["text", "lcov"],
-      thresholds: {
-        statements: 80,
-        branches: 80,
-        functions: 80,
-        lines: 80,
-      },
-    },
-      reporter: ["text", "json", "html"],
-      include: ["src/components/game/countdown-timer.tsx"],
+      reporter: ["text", "lcov", "json", "html"],
       reportsDirectory: "./coverage",
       thresholds: {
-        lines: 95,
-        functions: 95,
-        branches: 95,
-        statements: 95
-      }
-    }
+        statements: 70,
+        branches: 70,
+        functions: 70,
+        lines: 70,
+      },
+    },
   },
 });

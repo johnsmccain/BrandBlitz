@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
   isRetriableStellarError: vi.fn(),
   queueAdd: vi.fn(),
   emitCounterMetric: vi.fn(),
+  verifySessionHmac: vi.fn().mockReturnValue(true),
+  metricsInc: vi.fn(),
   logger: {
     info: vi.fn(),
     warn: vi.fn(),
@@ -61,6 +63,14 @@ vi.mock("../lib/logger", () => ({
   logger: mocks.logger,
 }));
 
+vi.mock("../lib/integrity", () => ({
+  verifySessionHmac: mocks.verifySessionHmac,
+}));
+
+vi.mock("../lib/metrics", () => ({
+  metrics: { inc: mocks.metricsInc },
+}));
+
 import { processPayout } from "./payout";
 
 // ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -69,6 +79,7 @@ const challengeFixture: Challenge = {
   id: "challenge-1",
   brand_id: "brand-1",
   challenge_id: "memo-1",
+  pool_amount_stroops: "900000000",
   pool_amount_usdc: "90.0000000",
   status: "ended",
   stellar_deposit_tx: null,
@@ -91,18 +102,25 @@ function buildLeaderboardSession(
     warmup_completed_at: null,
     challenge_started_at: null,
     completed_at: "2026-04-24T10:30:00.000Z",
+    round_1_answer: null,
     round_1_score: 100,
+    round_2_answer: null,
     round_2_score: 100,
+    round_3_answer: null,
     round_3_score: 100,
     total_score: 300,
+    rank: null,
     flagged: false,
     flag_reasons: null,
     is_practice: false,
+    integrity_hmac: "valid-hmac",
     created_at: "2026-04-24T10:00:00.000Z",
     username: "player@example.com",
     avatar_url: "https://example.com/avatar.png",
     display_name: "Player",
     league: "bronze",
+    display_name: "Player One",
+    league: null,
     total_earned_usdc: "0.0000000",
     stellar_address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
     ...overrides,
@@ -118,6 +136,7 @@ describe("processPayout", () => {
     process.env.HOT_WALLET_SECRET = "SBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
     process.env.STELLAR_NETWORK = "testnet";
 
+    mocks.verifySessionHmac.mockReturnValue(true);
     mocks.getChallengeById.mockResolvedValue(challengeFixture);
     mocks.createPayout.mockImplementation(async ({ userId }: { userId: string }) => ({
       id: `payout-${userId}`,
@@ -212,7 +231,12 @@ describe("processPayout", () => {
   });
 
   it("marks payouts failed when Stellar submission fails", async () => {
-    mocks.getChallengeById.mockResolvedValue({ ...challengeFixture, id: "challenge-3", pool_amount_usdc: "20.0000000" });
+    mocks.getChallengeById.mockResolvedValue({
+      ...challengeFixture,
+      id: "challenge-3",
+      pool_amount_stroops: "200000000",
+      pool_amount_usdc: "20.0000000",
+    });
     mocks.getLeaderboard.mockResolvedValue([
       buildLeaderboardSession({ id: "session-1", user_id: "user-1", total_score: 100, stellar_address: "GUSER1" }),
       buildLeaderboardSession({ id: "session-2", user_id: "user-2", total_score: 50, stellar_address: "GUSER2" }),
@@ -243,6 +267,8 @@ describe("processPayout", () => {
       undefined,
       "tx_failed"
     );
+    expect(mocks.updatePayoutStatus).toHaveBeenCalledWith("payout-user-1", "failed", undefined, "tx_failed");
+    expect(mocks.updatePayoutStatus).toHaveBeenCalledWith("payout-user-2", "failed", undefined, "tx_failed");
     expect(mocks.updateChallengeStatus).toHaveBeenCalledWith("challenge-3", "payout_failed", undefined);
   });
 
@@ -280,7 +306,12 @@ describe("processPayout", () => {
   });
 
   it("skips recipients whose share falls below the dust threshold", async () => {
-    mocks.getChallengeById.mockResolvedValue({ ...challengeFixture, id: "challenge-5", pool_amount_usdc: "0.0000001" });
+    mocks.getChallengeById.mockResolvedValue({
+      ...challengeFixture,
+      id: "challenge-5",
+      pool_amount_stroops: "1",
+      pool_amount_usdc: "0.0000001",
+    });
     mocks.getLeaderboard.mockResolvedValue([
       buildLeaderboardSession({ id: "session-1", user_id: "user-1", total_score: 9999999, stellar_address: "GUSER1" }),
       buildLeaderboardSession({ id: "session-2", user_id: "user-2", total_score: 1, stellar_address: "GUSER2" }),
@@ -300,7 +331,7 @@ describe("processPayout", () => {
       challengeId: "challenge-5",
       userId: "user-1",
       stellarAddress: "GUSER1",
-      amountUsdc: "0.0000001",
+      amountStroops: 1n,
     });
     expect(mocks.submitBatchPayout).toHaveBeenCalledWith(
       [{ address: "GUSER1", amount: "0.0000001" }],
@@ -309,5 +340,108 @@ describe("processPayout", () => {
       "testnet",
       expect.any(Object)
     );
+  });
+
+  it("aborts payout and logs critical error when a session integrity HMAC does not match", async () => {
+    mocks.getChallengeById.mockResolvedValue({ ...challengeFixture, id: "challenge-6" });
+    mocks.getLeaderboard.mockResolvedValue([
+      buildLeaderboardSession({
+        id: "session-tampered",
+        user_id: "user-1",
+        total_score: 999,
+        integrity_hmac: "invalid-hmac",
+        stellar_address: "GUSER1",
+      }),
+    ]);
+    mocks.verifySessionHmac.mockReturnValue(false);
+
+    await expect(processPayout("challenge-6")).rejects.toThrow("session-tampered");
+
+    expect(mocks.submitBatchPayout).not.toHaveBeenCalled();
+    expect(mocks.metricsInc).toHaveBeenCalledWith("antiCheat.integrity_hmac_tampered_total");
+    expect(mocks.logger.error).toHaveBeenCalledWith(
+      "Session integrity check failed — payout aborted",
+      expect.objectContaining({ sessionId: "session-tampered" })
+    );
+  });
+
+  it("proceeds normally when all sessions pass integrity verification", async () => {
+    mocks.getLeaderboard.mockResolvedValue([
+      buildLeaderboardSession({
+        id: "session-ok",
+        user_id: "user-1",
+        total_score: 300,
+        integrity_hmac: "valid-hmac",
+        stellar_address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      }),
+    ]);
+    mocks.verifySessionHmac.mockReturnValue(true);
+
+    await processPayout("challenge-1");
+
+    expect(mocks.submitBatchPayout).toHaveBeenCalledTimes(1);
+    expect(mocks.metricsInc).not.toHaveBeenCalledWith("antiCheat.integrity_hmac_tampered_total");
+  });
+
+  it("failed payout always carries a non-empty error message from the Stellar result", async () => {
+    mocks.getChallengeById.mockResolvedValue({ ...challengeFixture, id: "challenge-msg-1" });
+    mocks.getLeaderboard.mockResolvedValue([
+      buildLeaderboardSession({ id: "session-1", user_id: "user-1", total_score: 100, stellar_address: "GUSER1" }),
+    ]);
+    mocks.submitBatchPayout.mockResolvedValue([
+      {
+        txHash: "",
+        recipients: [{ address: "GUSER1", amount: "90.0000000" }],
+        success: false,
+        error: "horizon: transaction timed out",
+      },
+    ]);
+
+    await processPayout("challenge-msg-1");
+
+    const [, status, , errorMessage] = mocks.updatePayoutStatus.mock.calls[0] as [string, string, string, string];
+    expect(status).toBe("failed");
+    expect(errorMessage).toBeTruthy();
+    expect(errorMessage.length).toBeGreaterThan(0);
+  });
+
+  it("failed payout uses a fallback message when Stellar result carries no error field", async () => {
+    mocks.getChallengeById.mockResolvedValue({ ...challengeFixture, id: "challenge-msg-2" });
+    mocks.getLeaderboard.mockResolvedValue([
+      buildLeaderboardSession({ id: "session-1", user_id: "user-1", total_score: 100, stellar_address: "GUSER1" }),
+    ]);
+    mocks.submitBatchPayout.mockResolvedValue([
+      {
+        txHash: "",
+        recipients: [{ address: "GUSER1", amount: "90.0000000" }],
+        success: false,
+        // no error field — service must supply a fallback
+      },
+    ]);
+
+    await processPayout("challenge-msg-2");
+
+    const [, status, , errorMessage] = mocks.updatePayoutStatus.mock.calls[0] as [string, string, string, string];
+    expect(status).toBe("failed");
+    expect(errorMessage).toBeTruthy();
+    expect(errorMessage.length).toBeGreaterThan(0);
+  });
+
+  it("successful payout writes an empty error_message so the CHECK constraint is satisfied", async () => {
+    mocks.getLeaderboard.mockResolvedValue([
+      buildLeaderboardSession({
+        id: "session-ok2",
+        user_id: "user-1",
+        total_score: 300,
+        stellar_address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      }),
+    ]);
+
+    await processPayout("challenge-1");
+
+    // updatePayoutStatus called with status "sent" and no error message (undefined → db writes "")
+    const [, status, , errorMessage] = mocks.updatePayoutStatus.mock.calls[0] as [string, string, string, string | undefined];
+    expect(status).toBe("sent");
+    expect(errorMessage).toBeUndefined();
   });
 });

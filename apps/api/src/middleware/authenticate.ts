@@ -6,6 +6,7 @@ import { redis } from "../lib/redis";
 export interface AuthPayload {
   sub: string;   // user ID
   email: string;
+  role: string;
   iat: number;
   exp: number;
 }

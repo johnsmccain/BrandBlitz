@@ -5,11 +5,9 @@ import { logger } from "../../lib/logger";
 import { failPayoutsForChallenge } from "../../db/queries/payouts";
 import { query } from "../../db";
 import { payoutJobOptions } from "../payout.queue";
+import { config } from "../../lib/config";
 
-export const PAYOUT_WORKER_CONCURRENCY = parseInt(
-  process.env.PAYOUT_WORKER_CONCURRENCY ?? "2",
-  10
-);
+export const PAYOUT_WORKER_CONCURRENCY = config.PAYOUT_WORKER_CONCURRENCY;
 
 export const payoutWorkerOptions = {
   connection: redis,

@@ -1,5 +1,7 @@
 "use client";
 
+import { z } from "zod";
+
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { createApiClient } from "@/lib/api";
@@ -52,6 +54,19 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
     hasValidDuration &&
     Boolean(logoKey);
 
+const FormSchema = z.object({
+  name: z.string().min(1, "Brand name is required").max(100),
+  tagline: z.string().max(100).optional(),
+  brandStory: z.string().max(500).optional(),
+  primaryColor: z.string().regex(/^#[0-9a-fA-F]{6}$/, "Invalid primary color"),
+  secondaryColor: z.string().regex(/^#[0-9a-fA-F]{6}$/, "Invalid secondary color"),
+  poolAmountUsdc: z.string().refine((val) => Number(val) >= 10, "Minimum pool amount is 10 USDC"),
+  durationHours: z.string().refine((val) => {
+    const num = Number(val);
+    return Number.isInteger(num) && num >= 1 && num <= 720;
+  }, "Duration must be between 1 and 720 hours"),
+});
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!canSubmit) {
@@ -60,28 +75,34 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
 
     setError(null);
 
+    const validationResult = FormSchema.safeParse(fields);
+    if (!validationResult.success) {
+      setError(validationResult.error.issues.map(err => err.message).join(", "));
+      return;
+    }
+
     try {
       await wrap(async () => {
         const api = createApiClient(apiToken);
         const [productImage1Key, productImage2Key] = productImageKeys;
 
-        const brandRes = await api.post("/brands", {
-          name: fields.name,
-          tagline: fields.tagline,
-          brandStory: fields.description,
-          primaryColor: fields.primaryColor,
-          secondaryColor: fields.secondaryColor,
-          logoKey,
-          usp: fields.tagline || undefined,
-          productImage1Key: productImageKeys[0],
-          productImage2Key: productImageKeys[1],
-          brandStory: fields.brandStory,
-          primaryColor: fields.primaryColor,
-          secondaryColor: fields.secondaryColor,
-          logoKey,
-          productImage1Key,
-          productImage2Key,
-        });
+        // Note: The API expects S3 keys (logoKey, productImageKeys).
+        // The backend handles the conversion from these keys to public URLs after optimizing.
+        const brandRes = await api.post(
+          "/brands",
+          {
+            name: fields.name,
+            tagline: fields.tagline,
+            brandStory: fields.brandStory,
+            primaryColor: fields.primaryColor,
+            secondaryColor: fields.secondaryColor,
+            logoKey,
+            usp: fields.tagline || undefined,
+            productImage1Key: productImageKeys[0],
+            productImage2Key: productImageKeys[1],
+          },
+          { skipErrorToast: true }
+        );
 
         const brandId = brandRes.data.brand.id;
         const parsedDurationHours = Number.parseInt(fields.durationHours, 10);
@@ -90,29 +111,21 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
           : 72;
         const endsAt = new Date(Date.now() + durationHours * 60 * 60 * 1000).toISOString();
 
-        const challengeRes = await api.post("/brands/challenges", {
-          brandId,
-          poolAmountUsdc: fields.poolAmountUsdc,
-          endsAt: new Date(
-            Date.now() + parseInt(fields.durationHours, 10) * 60 * 60 * 1000
-          ).toISOString(),
-        });
-
-        const { depositInstructions } = challengeRes.data;
-
-        router.push(
-          `/brand/${brandId}?depositAddress=${encodeURIComponent(
-            depositInstructions.hotWalletAddress
-          )}&memo=${encodeURIComponent(depositInstructions.memo)}&amount=${encodeURIComponent(
-            depositInstructions.amount
-          )}`
+        // Fix path if it should be /challenges instead of /brands/challenges or vice-versa
+        // Assuming backend uses /brands/challenges based on the routes
+        const challengeRes = await api.post(
+          "/brands/challenges",
+          {
+            brandId,
+            poolAmountUsdc: fields.poolAmountUsdc,
+            endsAt,
+          },
+          { skipErrorToast: true }
         );
 
-        const { hotWalletAddress, memo } = challengeRes.data.depositInstructions;
-
-        router.push(
-          `/brand/${brandId}?depositAddress=${encodeURIComponent(hotWalletAddress ?? "")}&memo=${encodeURIComponent(memo ?? "")}`
-        );
+        // Deposit info is now fetched server-side from /challenges/:id/deposit-info
+        // Do NOT include secrets in URL query params
+        router.push(`/brand/${brandId}`);
       });
     } catch (err: any) {
       setError(err?.response?.data?.message ?? "Failed to create brand. Please try again.");
@@ -163,7 +176,7 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-2">
               <Label htmlFor="primaryColor">Primary Color</Label>
               <div className="flex items-center gap-2">
@@ -183,11 +196,18 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
                   className="font-mono"
                   pattern="^#[0-9a-f]{6}$"
                   aria-invalid={!HEX_COLOR_PATTERN.test(fields.primaryColor)}
+                  aria-describedby={
+                    !HEX_COLOR_PATTERN.test(fields.primaryColor)
+                      ? "primaryColorHexError"
+                      : undefined
+                  }
                   spellCheck={false}
                 />
               </div>
               {!HEX_COLOR_PATTERN.test(fields.primaryColor) ? (
-                <p className="text-xs text-red-500">Use format `#rrggbb` in lowercase.</p>
+                <p id="primaryColorHexError" className="text-xs text-red-500">
+                  Use format `#rrggbb` in lowercase.
+                </p>
               ) : null}
             </div>
             <div className="space-y-2">
@@ -209,11 +229,18 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
                   className="font-mono"
                   pattern="^#[0-9a-f]{6}$"
                   aria-invalid={!HEX_COLOR_PATTERN.test(fields.secondaryColor)}
+                  aria-describedby={
+                    !HEX_COLOR_PATTERN.test(fields.secondaryColor)
+                      ? "secondaryColorHexError"
+                      : undefined
+                  }
                   spellCheck={false}
                 />
               </div>
               {!HEX_COLOR_PATTERN.test(fields.secondaryColor) ? (
-                <p className="text-xs text-red-500">Use format `#rrggbb` in lowercase.</p>
+                <p id="secondaryColorHexError" className="text-xs text-red-500">
+                  Use format `#rrggbb` in lowercase.
+                </p>
               ) : null}
             </div>
           </div>
@@ -230,7 +257,6 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
             <Label>Logo</Label>
             <UploadField
               label="Upload Brand Logo"
-              accept="image/png,image/svg+xml,image/jpeg,image/webp"
               uploadType="brand-logo"
               apiToken={apiToken}
               onUploaded={(key) => setLogoKey(key)}
@@ -241,7 +267,6 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
             <Label>Product Images (optional)</Label>
             <UploadField
               label="Upload Product Image"
-              accept="image/*"
               uploadType="product-image"
               apiToken={apiToken}
               onUploaded={(key) =>
@@ -297,7 +322,11 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
       </Card>
 
       {error && (
-        <p className="text-sm text-red-500 bg-red-50 border border-red-200 rounded-lg p-3">
+        <p
+          role="alert"
+          aria-live="assertive"
+          className="text-sm text-red-500 bg-red-50 border border-red-200 rounded-lg p-3"
+        >
           {error}
         </p>
       )}

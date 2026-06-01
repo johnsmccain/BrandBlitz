@@ -40,18 +40,32 @@ vi.mock("../middleware/authenticate", () => ({
   tokenTtlSeconds: () => 600,
 }));
 vi.mock("../middleware/anti-cheat", () => ({
-  enforceOneSessionPerChallenge: (req: any, res: any, next: any) => next(),
+  enforceOneSessionPerChallenge: (req: any, res: any, next: any) => {
+    // Attach a mock session so the handler can use it
+    req.session = { id: "s1", user_id: "user123" };
+    next();
+  },
   validateReactionTime: (req: any, res: any, next: any) => next(),
   validateDeviceFingerprint: (req: any, res: any, next: any) => next(),
 }));
 vi.mock("../middleware/rate-limit", () => ({
   challengeStartLimiter: (req: any, res: any, next: any) => next(),
 }));
+vi.mock("../lib/integrity", () => ({
+  computeSessionHmac: vi.fn().mockReturnValue("test-hmac"),
+}));
+vi.mock("@brandblitz/stellar", () => ({
+  WARMUP_MIN_SECONDS: 20,
+}));
+vi.mock("../services/streaks", () => ({
+  updateStreak: vi.fn(),
+}));
 
 import * as challengeQueries from "../db/queries/challenges";
 import * as sessionQueries from "../db/queries/sessions";
 import { redis } from "../lib/redis";
 import * as scoringService from "../services/scoring";
+import { updateStreak } from "../services/streaks";
 
 const app = express();
 app.use(express.json());
@@ -69,9 +83,7 @@ describe("Sessions API", () => {
       (challengeQueries.getChallengeById as any).mockResolvedValue({ id: "c1", status: "active" });
       (sessionQueries.createSession as any).mockResolvedValue({ id: "s1" });
 
-      const res = await request(app)
-        .post("/sessions/c1/warmup-start")
-        .send({ isPractice: false });
+      const res = await request(app).post("/sessions/c1/warmup-start").send({ isPractice: false });
 
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty("sessionId", "s1");
@@ -157,7 +169,7 @@ describe("Sessions API", () => {
 
       expect(res.status).toBe(200);
       expect(res.body.score).toBe(100);
-      expect(sessionQueries.recordRoundScore).toHaveBeenCalledWith("s1", 1, 100);
+      expect(sessionQueries.recordRoundScore).toHaveBeenCalledWith("s1", 1, 100, "A", 500);
     });
 
     it("should accept timeout answer and score 0", async () => {
@@ -179,7 +191,7 @@ describe("Sessions API", () => {
 
       expect(res.status).toBe(200);
       expect(res.body.score).toBe(0);
-      expect(sessionQueries.recordRoundScore).toHaveBeenCalledWith("s1", 1, 0);
+      expect(sessionQueries.recordRoundScore).toHaveBeenCalledWith("s1", 1, 0, null, 15000);
       expect(scoringService.calculateRoundScore).toHaveBeenCalledWith({
         selectedOption: null,
         correctOption: "A",
@@ -187,7 +199,7 @@ describe("Sessions API", () => {
       });
     });
 
-    it("should finalize session on round 3", async () => {
+    it("should finalize session on round 3 and store HMAC", async () => {
       (challengeQueries.getChallengeById as any).mockResolvedValue({ id: "c1" });
       (sessionQueries.getSession as any).mockResolvedValue({
         id: "s1",
@@ -197,6 +209,12 @@ describe("Sessions API", () => {
       (challengeQueries.getChallengeQuestions as any).mockResolvedValue([
         { round: 3, correct_option: "B" },
       ]);
+      (sessionQueries.finishSession as any).mockResolvedValue({
+        id: "s1",
+        user_id: "user123",
+        total_score: 300,
+        completed_at: new Date().toISOString(),
+      });
 
       const res = await request(app)
         .post("/sessions/c1/answer/3")
@@ -239,9 +257,11 @@ describe("Sessions API", () => {
         .send({ selectedOption: "B", reactionTimeMs: 400 });
 
       expect(replay.status).toBe(401);
+      expect(sessionQueries.storeSessionHmac).toHaveBeenCalledWith("s1", "test-hmac");
+      expect(updateStreak).toHaveBeenCalledWith("user123");
     });
 
-    it("should 409 if session already completed", async () => {
+    it("should 409 if session already completed on round 1", async () => {
       (challengeQueries.getChallengeById as any).mockResolvedValue({ id: "c1" });
       (sessionQueries.getSession as any).mockResolvedValue({
         id: "s1",
@@ -255,6 +275,58 @@ describe("Sessions API", () => {
         .send({ selectedOption: "A", reactionTimeMs: 500 });
 
       expect(res.status).toBe(409);
+    });
+
+    it("should return 200 with cached result on idempotent round-3 replay", async () => {
+      (challengeQueries.getChallengeById as any).mockResolvedValue({ id: "c1" });
+      (sessionQueries.getSession as any).mockResolvedValue({
+        id: "s1",
+        user_id: "user123",
+        challenge_started_at: new Date(),
+        completed_at: new Date(),
+        round_3_answer: "A",
+        round_3_score: 100,
+        total_score: 300,
+        rank: 2,
+      });
+      (challengeQueries.getChallengeQuestions as any).mockResolvedValue([
+        { round: 3, correct_option: "A" },
+      ]);
+      (scoringService.validateAnswer as any).mockReturnValue(true);
+
+      const res = await request(app)
+        .post("/sessions/c1/answer/3")
+        .send({ selectedOption: "A", reactionTimeMs: 500 });
+
+      expect(res.status).toBe(200);
+      expect(res.body.score).toBe(100);
+      expect(res.body.total_score).toBe(300);
+      expect(res.body.rank).toBe(2);
+      expect(sessionQueries.recordRoundScore).not.toHaveBeenCalled();
+      expect(sessionQueries.finishSession).not.toHaveBeenCalled();
+    });
+
+    it("should return 409 CONFLICT_REPLAY when round-3 replay has a different answer", async () => {
+      (challengeQueries.getChallengeById as any).mockResolvedValue({ id: "c1" });
+      (sessionQueries.getSession as any).mockResolvedValue({
+        id: "s1",
+        user_id: "user123",
+        challenge_started_at: new Date(),
+        completed_at: new Date(),
+        round_3_answer: "A",
+        round_3_score: 100,
+        total_score: 300,
+      });
+      (challengeQueries.getChallengeQuestions as any).mockResolvedValue([
+        { round: 3, correct_option: "A" },
+      ]);
+
+      const res = await request(app)
+        .post("/sessions/c1/answer/3")
+        .send({ selectedOption: "B", reactionTimeMs: 500 });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe("CONFLICT_REPLAY");
     });
 
     it("should 403 if session is flagged", async () => {

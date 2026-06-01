@@ -16,7 +16,10 @@ vi.mock("../db/queries/brands", () => ({
   getBrandsByOwner: vi.fn(),
   getBrandById: mocks.getBrandById,
   getActiveDistractorBrands: mocks.getActiveDistractorBrands,
+  toBrandApi: (brand: Brand) => ({ ...brand, product_image_urls: [] }),
   updateBrand: vi.fn(),
+  deleteBrand: vi.fn(),
+  getBrandMetaById: vi.fn(),
 }));
 
 vi.mock("../db/queries/challenges", () => ({
@@ -38,6 +41,11 @@ vi.mock("../middleware/authenticate", () => ({
 
 vi.mock("@brandblitz/storage", () => ({
   optimizeImage: vi.fn(),
+  getPublicUrl: (_bucket: string, key: string) => `https://storage.example.com/${key}`,
+  BUCKETS: {
+    BRAND_ASSETS: "brand-assets",
+  },
+  StorageError: class StorageError extends Error {},
 }));
 
 vi.mock("../lib/logger", () => ({
@@ -66,8 +74,7 @@ function buildBrand(params: {
     tagline: params.tagline,
     brand_story: null,
     usp: params.usp,
-    product_image_1_url: params.hasProductImage ?? true ? "https://img.example/product.webp" : null,
-    product_image_2_url: null,
+    product_image_keys: params.hasProductImage ?? true ? ["product.webp"] : [],
     created_at: "2026-04-24T00:00:00.000Z",
   };
 }
@@ -77,6 +84,7 @@ function buildChallenge(brandId: string): Challenge {
     id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     brand_id: brandId,
     challenge_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    pool_amount_stroops: "500000000",
     pool_amount_usdc: "50.0000000",
     status: "pending_deposit",
     stellar_deposit_tx: null,

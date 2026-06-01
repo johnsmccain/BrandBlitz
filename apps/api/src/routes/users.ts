@@ -8,6 +8,9 @@ import {
   updateUserWallet,
   getUserPublicProfileByUsername,
 } from "../db/queries/users";
+import { getReferralStats } from "../services/referrals";
+import { stroopsToUsdc } from "../lib/usdc";
+import { getStreak, repairStreak } from "../services/streaks";
 import {
   sendVerificationCode,
   checkVerificationCode,
@@ -52,6 +55,48 @@ router.get("/me", authenticate, async (req, res) => {
   res.json({ user: safeUser });
 });
 
+router.get("/me/streak", authenticate, async (req, res) => {
+  const streak = await getStreak(req.user!.sub).catch(() => null);
+  if (!streak) throw createError("User not found", 404);
+
+  res.json(streak);
+});
+
+router.get("/:id/streak", authenticate, async (req, res) => {
+  const { id } = z.object({ id: z.string() }).parse(req.params);
+  if (id !== req.user!.sub) throw createError("Forbidden", 403, "FORBIDDEN");
+
+  const streak = await getStreak(id).catch(() => null);
+  if (!streak) throw createError("User not found", 404);
+
+  res.json({
+    streak: streak.streak,
+    last_play_day: streak.lastPlayDay,
+    repair_available: streak.repairAvailable,
+  });
+});
+
+router.get("/me/referrals/stats", authenticate, async (req, res) => {
+  const stats = await getReferralStats(req.user!.sub);
+
+  res.json({
+    referralCode: stats.referralCode,
+    invitesSent: stats.invitesSent,
+    conversions: stats.conversions,
+    totalEarned: stroopsToUsdc(stats.totalEarnedStroops),
+    totalEarnedUsdc: stroopsToUsdc(stats.totalEarnedStroops),
+  });
+});
+
+router.post("/streaks/repair", authenticate, async (req, res) => {
+  const repaired = await repairStreak(req.user!.sub);
+  if (!repaired) {
+    throw createError("Monthly streak repair already used", 409, "STREAK_REPAIR_LIMIT");
+  }
+
+  res.json(repaired);
+});
+
 /**
  * GET /users/profile/:username
  * Public profile — display name, stats. No auth required.
@@ -70,6 +115,7 @@ router.get("/profile/:username", apiLimiter, async (req, res) => {
       totalEarned: user.total_earned_usdc,
       totalChallenges: user.challenges_played,
       avatarUrl: user.avatar_url,
+      streak: user.streak,
     },
   });
 });

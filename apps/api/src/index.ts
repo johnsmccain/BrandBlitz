@@ -1,12 +1,18 @@
 import "dotenv/config";
+// Sentry must be initialised before any other imports that use it.
+import { initSentry } from "./lib/sentry";
+void initSentry();
 import express from "express";
 import helmet from "helmet";
 import cors from "cors";
+import compression from "compression";
 import cookieParser from "cookie-parser";
 import { registerRoutes } from "./routes";
 import { errorHandler } from "./middleware/error";
+import { referralAttributionMiddleware } from "./middleware/referral-attribution";
 import { apiLimiter } from "./middleware/rate-limit";
-import { connectDb, closeDb } from "./db";
+import { requireHttps } from "./middleware/require-https";
+import { connectDb, closeDb, query } from "./db";
 import { connectRedis, redis } from "./lib/redis";
 import { payoutQueue } from "./queues/payout.queue";
 import { leagueQueue } from "./queues/league.queue";
@@ -18,15 +24,80 @@ const PORT = config.PORT;
 let isShuttingDown = false;
 
 // ── Security & Parsing ─────────────────────────────────────────────────────
-app.use(helmet());
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"], // Allow inline styles for error pages
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: [
+          "'self'",
+          "https://api.stellar.expert",
+          config.S3_PUBLIC_URL,
+        ],
+        fontSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        mediaSrc: ["'self'"],
+        frameSrc: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"],
+        upgradeInsecureRequests: config.NODE_ENV === "production" ? [] : null,
+      },
+    },
+    strictTransportSecurity:
+      config.NODE_ENV === "production"
+        ? {
+            maxAge: 31536000,
+            includeSubDomains: true,
+            preload: true,
+          }
+        : false,
+    referrerPolicy: {
+      policy: "strict-origin-when-cross-origin",
+    },
+    xFrameOptions: {
+      action: "deny",
+    },
+    xContentTypeOptions: true,
+    xDnsPrefetchControl: {
+      allow: false,
+    },
+    xDownloadOptions: true,
+    xPermittedCrossDomainPolicies: {
+      permittedPolicies: "none",
+    },
+  }),
+);
 app.use(
   cors({
     origin: config.WEB_URL,
     credentials: true,
-  })
+  }),
 );
 app.use(cookieParser());
-app.use(express.json({ limit: "1mb" }));
+app.use(requireHttps);
+app.use(referralAttributionMiddleware);
+app.use(
+  compression({
+    threshold: 1024,
+  })
+);
+app.use(
+  express.json({
+    limit: "1mb",
+    verify: (req, _res, buf) => {
+      if (
+        req.headers["x-webhook-signature"] ||
+        req.path.startsWith("/webhooks")
+      ) {
+        (req as any).rawBody = buf;
+      }
+    },
+  }),
+);
 app.use(express.urlencoded({ extended: true }));
 
 // ── Global rate limit ──────────────────────────────────────────────────────
@@ -38,7 +109,11 @@ app.get("/health", (_req, res) => {
     res.status(503).json({ status: "shutting_down" });
     return;
   }
-  res.json({ status: "ok", uptime: process.uptime(), timestamp: new Date().toISOString() });
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ── API Routes ─────────────────────────────────────────────────────────────
@@ -53,6 +128,19 @@ export { app };
 async function start(): Promise<void> {
   await connectDb();
   await connectRedis();
+
+  // ── Admin bootstrap ──────────────────────────────────────────────────────
+  if (config.ADMIN_BOOTSTRAP_EMAIL) {
+    const result = await query(
+      "UPDATE users SET role = 'admin', updated_at = NOW() WHERE email = $1 AND deleted_at IS NULL AND role != 'admin' RETURNING id, email",
+      [config.ADMIN_BOOTSTRAP_EMAIL]
+    );
+    if (result.rows.length > 0) {
+      logger.info(`Admin role granted to bootstrap email: ${result.rows[0].email}`);
+    } else {
+      logger.info(`Admin bootstrap: ${config.ADMIN_BOOTSTRAP_EMAIL} already admin or not found`);
+    }
+  }
 
   const server = app.listen(PORT, () => {
     logger.info(`API running on port ${PORT}`, { env: config.NODE_ENV });
