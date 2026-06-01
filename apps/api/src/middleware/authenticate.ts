@@ -5,7 +5,7 @@ import { config } from "../lib/config";
 export interface AuthPayload {
   sub: string;   // user ID
   email: string;
-  status?: "active" | "suspended";
+  role: string;
   iat: number;
   exp: number;
 }
