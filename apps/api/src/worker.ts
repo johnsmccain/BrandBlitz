@@ -13,6 +13,10 @@ import { createGdprErasureWorker } from "./queues/processors/gdpr-erasure.proces
 import { createReferralBonusWorker } from "./queues/processors/referral-bonus.processor";
 import { ensureLeagueRepeatableJobs } from "./queues/league.queue";
 import { createSessionTimeoutWorker } from "./queues/processors/session-timeout.processor";
+import {
+  createLeaderboardRefreshWorker,
+  leaderboardRefreshQueue,
+} from "./queues/leaderboard-refresh.queue";
 import { referralBonusQueue } from "./queues/referral-bonus.queue";
 import {
   ensureSessionTimeoutSweepJob,
@@ -31,12 +35,13 @@ async function startWorker(): Promise<void> {
   const gdprErasureWorker = createGdprErasureWorker();
   const referralBonusWorker = createReferralBonusWorker();
   const sessionTimeoutWorker = createSessionTimeoutWorker();
+  const leaderboardRefreshWorker = createLeaderboardRefreshWorker();
   await scheduleArchiveJob();
   await ensureLeagueRepeatableJobs();
   await ensureSessionTimeoutSweepJob();
   const evictionMonitor = startRedisEvictionMonitor();
   logger.info(
-    "BullMQ worker started — processing payout + archive + league + gdpr-erasure + referral-bonus + session-timeout jobs",
+    "BullMQ worker started — processing payout + archive + league + gdpr-erasure + referral-bonus + session-timeout + leaderboard-refresh jobs",
   );
 
   const shutdown = async (signal: string) => {
@@ -48,8 +53,10 @@ async function startWorker(): Promise<void> {
     await gdprErasureWorker.close();
     await referralBonusWorker.close();
     await sessionTimeoutWorker.close();
+    await leaderboardRefreshWorker.close();
     await referralBonusQueue.close();
     await sessionTimeoutQueue.close();
+    await leaderboardRefreshQueue.close();
     await closeDb();
     await redis.disconnect();
     drainSharedAgent();
